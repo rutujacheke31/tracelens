@@ -1,4 +1,10 @@
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models import BugReport
+
 
 app = FastAPI(
     title="TraceLens API",
@@ -31,6 +37,7 @@ MAX_SCREENSHOT_SIZE_BYTES = 5 * BYTES_PER_MEGABYTE
 MAX_SUPPORTING_FILE_SIZE_BYTES = 10 * BYTES_PER_MEGABYTE
 
 FILE_READ_CHUNK_SIZE_BYTES = 1 * BYTES_PER_MEGABYTE
+
 
 async def get_upload_size(
     uploaded_file: UploadFile,
@@ -74,6 +81,7 @@ async def analyze_bug(
     description: str = Form(...),
     screenshot: UploadFile | None = File(default=None),
     supporting_file: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
 ):
     cleaned_description = description.strip()
     validation_errors = []
@@ -164,15 +172,37 @@ async def analyze_bug(
                 "message": "Validation failed.",
                 "errors": validation_errors,
             },
-        )   
+        )
+
+    bug_report = BugReport(
+        description=cleaned_description,
+        screenshot_filename=screenshot.filename if screenshot else None,
+        supporting_file_filename=(
+            supporting_file.filename if supporting_file else None
+        ),
+    )
+
+    try:
+        db.add(bug_report)
+        db.commit()
+        db.refresh(bug_report)
+    except SQLAlchemyError as error:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "The bug report could not be saved.",
+            },
+        ) from error
 
     return {
         "message": "Bug report received successfully.",
-        "description": cleaned_description,
-        "screenshot_filename": screenshot.filename if screenshot else None,
+        "bug_report_id": bug_report.id,
+        "status": bug_report.status,
+        "description": bug_report.description,
+        "screenshot_filename": bug_report.screenshot_filename,
         "screenshot_size_bytes": screenshot_size,
-        "supporting_file_filename": (
-            supporting_file.filename if supporting_file else None
-        ),
+        "supporting_file_filename": bug_report.supporting_file_filename,
         "supporting_file_size_bytes": supporting_file_size,
     }

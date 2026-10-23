@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.models import BugReport
+from app.schemas.bug_report import BugReportResponse
 from app.services.storage import delete_report_uploads, save_upload_file
 
 
@@ -78,6 +79,28 @@ async def health_check() -> dict[str, str]:
         "status": "healthy",
     }
 
+@app.get(
+    "/bug-reports/{report_id}",
+    response_model=BugReportResponse,
+)
+async def get_bug_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+):
+    # Search the bug_reports table using its primary-key ID.
+    bug_report = db.get(BugReport, report_id)
+
+    # Return 404 when the requested report does not exist.
+    if bug_report is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Bug report not found.",
+            },
+        )
+
+    # FastAPI converts this database object using BugReportResponse.
+    return bug_report
 
 @app.post("/analyze")
 async def analyze_bug(

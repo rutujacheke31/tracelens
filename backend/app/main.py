@@ -1,9 +1,12 @@
+from pathlib import Path
+
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.models import BugReport
+from app.services.storage import delete_report_uploads, save_upload_file
 
 
 app = FastAPI(
@@ -14,11 +17,11 @@ app = FastAPI(
 
 MIN_DESCRIPTION_LENGTH = 10
 
-ALLOWED_SCREENSHOT_TYPES = {
-    "image/png",
-    "image/jpg",
-    "image/jpeg",
-    "image/webp",
+SCREENSHOT_EXTENSION_BY_CONTENT_TYPE = {
+    "image/png": ".png",
+    "image/jpg": ".jpg",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
 }
 
 ALLOWED_SUPPORTING_FILE_EXTENSIONS = (
@@ -87,7 +90,10 @@ async def analyze_bug(
     validation_errors = []
 
     screenshot_size = None
+    screenshot_extension = None
+
     supporting_file_size = None
+    supporting_file_extension = None
 
     if len(cleaned_description) < MIN_DESCRIPTION_LENGTH:
         validation_errors.append(
@@ -101,13 +107,17 @@ async def analyze_bug(
         )
 
     if screenshot:
-        if screenshot.content_type not in ALLOWED_SCREENSHOT_TYPES:
+        if screenshot.content_type not in SCREENSHOT_EXTENSION_BY_CONTENT_TYPE:
             validation_errors.append(
                 {
                     "field": "screenshot",
                     "message": "Screenshot must be a PNG, JPG, JPEG, or WebP image.",
                 }
             )
+        else:
+            screenshot_extension = SCREENSHOT_EXTENSION_BY_CONTENT_TYPE[
+                screenshot.content_type
+            ]
 
         screenshot_size = await get_upload_size(
             screenshot,
@@ -130,10 +140,15 @@ async def analyze_bug(
             )
 
     if supporting_file:
-        supporting_filename = (supporting_file.filename or "").lower()
+        supporting_filename = supporting_file.filename or ""
 
-        if not supporting_filename.endswith(
-            ALLOWED_SUPPORTING_FILE_EXTENSIONS
+        supporting_file_extension = Path(
+            supporting_filename
+        ).suffix.lower()
+
+        if (
+            supporting_file_extension
+            not in ALLOWED_SUPPORTING_FILE_EXTENSIONS
         ):
             validation_errors.append(
                 {
@@ -176,18 +191,51 @@ async def analyze_bug(
 
     bug_report = BugReport(
         description=cleaned_description,
-        screenshot_filename=screenshot.filename if screenshot else None,
+        screenshot_filename=(
+            screenshot.filename if screenshot else None
+        ),
+        screenshot_size_bytes=screenshot_size,
         supporting_file_filename=(
             supporting_file.filename if supporting_file else None
         ),
+        supporting_file_size_bytes=supporting_file_size,
+        status="received",
     )
+
+    report_id: int | None = None
 
     try:
         db.add(bug_report)
+        db.flush()
+
+        report_id = bug_report.id
+
+        if screenshot and screenshot_extension:
+            bug_report.screenshot_storage_key = await save_upload_file(
+                uploaded_file=screenshot,
+                report_id=report_id,
+                file_category="screenshot",
+                extension=screenshot_extension,
+            )
+
+        if supporting_file and supporting_file_extension:
+            bug_report.supporting_file_storage_key = await save_upload_file(
+                uploaded_file=supporting_file,
+                report_id=report_id,
+                file_category="supporting",
+                extension=supporting_file_extension,
+            )
+
         db.commit()
-        db.refresh(bug_report)
-    except SQLAlchemyError as error:
+
+    except (SQLAlchemyError, OSError) as error:
         db.rollback()
+
+        if report_id is not None:
+            try:
+                delete_report_uploads(report_id)
+            except OSError:
+                pass
 
         raise HTTPException(
             status_code=500,
@@ -202,7 +250,9 @@ async def analyze_bug(
         "status": bug_report.status,
         "description": bug_report.description,
         "screenshot_filename": bug_report.screenshot_filename,
-        "screenshot_size_bytes": screenshot_size,
+        "screenshot_size_bytes": bug_report.screenshot_size_bytes,
         "supporting_file_filename": bug_report.supporting_file_filename,
-        "supporting_file_size_bytes": supporting_file_size,
+        "supporting_file_size_bytes": (
+            bug_report.supporting_file_size_bytes
+        ),
     }

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy import BigInteger, DateTime, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,8 +23,28 @@ class BugReport(Base):
         nullable=True,
     )
 
+    screenshot_storage_key: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+    )
+
+    screenshot_size_bytes: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
+
     supporting_file_filename: Mapped[str | None] = mapped_column(
         String(255),
+        nullable=True,
+    )
+
+    supporting_file_storage_key: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+    )
+
+    supporting_file_size_bytes: Mapped[int | None] = mapped_column(
+        BigInteger,
         nullable=True,
     )
 

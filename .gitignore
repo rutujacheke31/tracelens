@@ -39,3 +39,5 @@ data/
 # Operating systems
 .DS_Store
 Thumbs.db
+
+backend/uploads/

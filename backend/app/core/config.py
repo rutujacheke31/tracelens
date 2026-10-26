@@ -8,11 +8,19 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 class Settings(BaseSettings):
+    # PostgreSQL connection settings loaded from the root .env file.
     postgres_db: str
     postgres_user: str
     postgres_password: str
     postgres_host: str = "localhost"
     postgres_port: int = 5432
+
+    # Local Ollama configuration. These can also be overridden in .env.
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5vl:3b"
+
+    # Local models can take longer, especially when running on the CPU.
+    ollama_timeout_seconds: float = 300.0
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

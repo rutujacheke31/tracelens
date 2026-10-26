@@ -1,13 +1,29 @@
+import logging
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models import BugReport
 from app.schemas.bug_report import BugReportResponse
-from app.services.storage import delete_report_uploads, save_upload_file
+from app.services.bug_analyzer import run_bug_analysis
+from app.services.storage import (
+    delete_report_uploads,
+    save_upload_file,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
@@ -47,10 +63,13 @@ async def get_upload_size(
     uploaded_file: UploadFile,
     max_size_bytes: int,
 ) -> int:
+    """Read an upload in chunks and calculate its size safely."""
     total_size = 0
 
     while True:
-        chunk = await uploaded_file.read(FILE_READ_CHUNK_SIZE_BYTES)
+        chunk = await uploaded_file.read(
+            FILE_READ_CHUNK_SIZE_BYTES
+        )
 
         if not chunk:
             break
@@ -60,9 +79,74 @@ async def get_upload_size(
         if total_size > max_size_bytes:
             break
 
+    # Reset the cursor so the file can be saved afterward.
     await uploaded_file.seek(0)
 
     return total_size
+
+
+async def process_bug_report_analysis(
+    report_id: int,
+) -> None:
+    """Analyze a saved report and store the result in PostgreSQL."""
+
+    # The request database session closes after the response.
+    # Therefore, the background task needs its own session.
+    db = SessionLocal()
+
+    try:
+        bug_report = db.get(BugReport, report_id)
+
+        if bug_report is None:
+            return
+
+        # Let clients know that Ollama has started processing.
+        bug_report.status = "analyzing"
+        db.commit()
+
+        analysis_result = await run_bug_analysis(
+            description=bug_report.description,
+            screenshot_storage_key=(
+                bug_report.screenshot_storage_key
+            ),
+            supporting_file_storage_key=(
+                bug_report.supporting_file_storage_key
+            ),
+        )
+
+        bug_report.analysis_result = analysis_result
+        bug_report.status = "completed"
+
+        db.commit()
+
+    except Exception:
+        # Log the full technical error in the server terminal.
+        logger.exception(
+            "Bug analysis failed for report ID %s.",
+            report_id,
+        )
+
+        db.rollback()
+
+        try:
+            failed_report = db.get(BugReport, report_id)
+
+            if failed_report is not None:
+                failed_report.status = "failed"
+                failed_report.analysis_result = {
+                    "error": (
+                        "TraceLens could not complete the analysis. "
+                        "Check the backend terminal for details."
+                    ),
+                }
+
+                db.commit()
+
+        except SQLAlchemyError:
+            db.rollback()
+
+    finally:
+        db.close()
 
 
 @app.get("/")
@@ -79,6 +163,7 @@ async def health_check() -> dict[str, str]:
         "status": "healthy",
     }
 
+
 @app.get(
     "/bug-reports/{report_id}",
     response_model=BugReportResponse,
@@ -90,7 +175,6 @@ async def get_bug_report(
     # Search the bug_reports table using its primary-key ID.
     bug_report = db.get(BugReport, report_id)
 
-    # Return 404 when the requested report does not exist.
     if bug_report is None:
         raise HTTPException(
             status_code=404,
@@ -102,8 +186,13 @@ async def get_bug_report(
     # FastAPI converts this database object using BugReportResponse.
     return bug_report
 
-@app.post("/analyze")
+
+@app.post(
+    "/analyze",
+    status_code=202,
+)
 async def analyze_bug(
+    background_tasks: BackgroundTasks,
     description: str = Form(...),
     screenshot: UploadFile | None = File(default=None),
     supporting_file: UploadFile | None = File(default=None),
@@ -118,6 +207,7 @@ async def analyze_bug(
     supporting_file_size = None
     supporting_file_extension = None
 
+    # Validate the description.
     if len(cleaned_description) < MIN_DESCRIPTION_LENGTH:
         validation_errors.append(
             {
@@ -129,18 +219,27 @@ async def analyze_bug(
             }
         )
 
+    # Validate the optional screenshot.
     if screenshot:
-        if screenshot.content_type not in SCREENSHOT_EXTENSION_BY_CONTENT_TYPE:
+        if (
+            screenshot.content_type
+            not in SCREENSHOT_EXTENSION_BY_CONTENT_TYPE
+        ):
             validation_errors.append(
                 {
                     "field": "screenshot",
-                    "message": "Screenshot must be a PNG, JPG, JPEG, or WebP image.",
+                    "message": (
+                        "Screenshot must be a PNG, JPG, "
+                        "JPEG, or WebP image."
+                    ),
                 }
             )
         else:
-            screenshot_extension = SCREENSHOT_EXTENSION_BY_CONTENT_TYPE[
-                screenshot.content_type
-            ]
+            screenshot_extension = (
+                SCREENSHOT_EXTENSION_BY_CONTENT_TYPE[
+                    screenshot.content_type
+                ]
+            )
 
         screenshot_size = await get_upload_size(
             screenshot,
@@ -158,10 +257,13 @@ async def analyze_bug(
             validation_errors.append(
                 {
                     "field": "screenshot",
-                    "message": "Screenshot cannot exceed 5 MB.",
+                    "message": (
+                        "Screenshot cannot exceed 5 MB."
+                    ),
                 }
             )
 
+    # Validate the optional supporting file.
     if supporting_file:
         supporting_filename = supporting_file.filename or ""
 
@@ -177,8 +279,9 @@ async def analyze_bug(
                 {
                     "field": "supporting_file",
                     "message": (
-                        "Supporting file must use a .log, .txt, .csv, .json, "
-                        ".pdf, .doc, or .docx extension."
+                        "Supporting file must use a .log, .txt, "
+                        ".csv, .json, .pdf, .doc, or .docx "
+                        "extension."
                     ),
                 }
             )
@@ -192,14 +295,21 @@ async def analyze_bug(
             validation_errors.append(
                 {
                     "field": "supporting_file",
-                    "message": "Supporting file cannot be empty.",
+                    "message": (
+                        "Supporting file cannot be empty."
+                    ),
                 }
             )
-        elif supporting_file_size > MAX_SUPPORTING_FILE_SIZE_BYTES:
+        elif (
+            supporting_file_size
+            > MAX_SUPPORTING_FILE_SIZE_BYTES
+        ):
             validation_errors.append(
                 {
                     "field": "supporting_file",
-                    "message": "Supporting file cannot exceed 10 MB.",
+                    "message": (
+                        "Supporting file cannot exceed 10 MB."
+                    ),
                 }
             )
 
@@ -212,6 +322,7 @@ async def analyze_bug(
             },
         )
 
+    # Create the database record before saving its uploaded files.
     bug_report = BugReport(
         description=cleaned_description,
         screenshot_filename=(
@@ -219,10 +330,12 @@ async def analyze_bug(
         ),
         screenshot_size_bytes=screenshot_size,
         supporting_file_filename=(
-            supporting_file.filename if supporting_file else None
+            supporting_file.filename
+            if supporting_file
+            else None
         ),
         supporting_file_size_bytes=supporting_file_size,
-        status="received",
+        status="queued",
     )
 
     report_id: int | None = None
@@ -234,19 +347,23 @@ async def analyze_bug(
         report_id = bug_report.id
 
         if screenshot and screenshot_extension:
-            bug_report.screenshot_storage_key = await save_upload_file(
-                uploaded_file=screenshot,
-                report_id=report_id,
-                file_category="screenshot",
-                extension=screenshot_extension,
+            bug_report.screenshot_storage_key = (
+                await save_upload_file(
+                    uploaded_file=screenshot,
+                    report_id=report_id,
+                    file_category="screenshot",
+                    extension=screenshot_extension,
+                )
             )
 
         if supporting_file and supporting_file_extension:
-            bug_report.supporting_file_storage_key = await save_upload_file(
-                uploaded_file=supporting_file,
-                report_id=report_id,
-                file_category="supporting",
-                extension=supporting_file_extension,
+            bug_report.supporting_file_storage_key = (
+                await save_upload_file(
+                    uploaded_file=supporting_file,
+                    report_id=report_id,
+                    file_category="supporting",
+                    extension=supporting_file_extension,
+                )
             )
 
         db.commit()
@@ -263,18 +380,34 @@ async def analyze_bug(
         raise HTTPException(
             status_code=500,
             detail={
-                "message": "The bug report could not be saved.",
+                "message": (
+                    "The bug report could not be saved."
+                ),
             },
         ) from error
 
+    # Start AI processing only after the database and files are saved.
+    background_tasks.add_task(
+        process_bug_report_analysis,
+        bug_report.id,
+    )
+
     return {
-        "message": "Bug report received successfully.",
+        "message": (
+            "Bug report saved. Analysis has been queued."
+        ),
         "bug_report_id": bug_report.id,
         "status": bug_report.status,
         "description": bug_report.description,
-        "screenshot_filename": bug_report.screenshot_filename,
-        "screenshot_size_bytes": bug_report.screenshot_size_bytes,
-        "supporting_file_filename": bug_report.supporting_file_filename,
+        "screenshot_filename": (
+            bug_report.screenshot_filename
+        ),
+        "screenshot_size_bytes": (
+            bug_report.screenshot_size_bytes
+        ),
+        "supporting_file_filename": (
+            bug_report.supporting_file_filename
+        ),
         "supporting_file_size_bytes": (
             bug_report.supporting_file_size_bytes
         ),

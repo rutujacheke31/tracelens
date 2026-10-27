@@ -10,6 +10,8 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
+
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -30,6 +32,18 @@ app = FastAPI(
     title="TraceLens API",
     description="Backend API for multimodal software bug investigation.",
     version="0.1.0",
+)
+
+# Allow the local React frontend to call the FastAPI backend.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MIN_DESCRIPTION_LENGTH = 10
